@@ -133,6 +133,8 @@ class AttributionBucket:
     changed_bytes: int = 0
     changed_ranges: int = 0
     blocks: int = 0
+    image_occurrences: int = 0
+    image_file_numbers: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -144,7 +146,21 @@ class DirectoryTreeNode:
     changed_bytes: int = 0
     changed_ranges: int = 0
     blocks: int = 0
+    image_occurrences: int = 0
+    image_file_numbers: list[int] = field(default_factory=list)
     children: list["DirectoryTreeNode"] = field(default_factory=list)
+
+
+@dataclass
+class AnalyzedImage:
+    file_path: Path
+    file_number: int
+    backup_type: str
+    parent_file_number: int | None
+    total_stored_bytes: int
+    total_changed_bytes: int
+    changed_block_count: int
+    bucket_count: int
 
 
 @dataclass
@@ -153,6 +169,8 @@ class AnalysisReport:
     target_file_number: int
     target_backup_type: str
     parent_file_number: int | None
+    requested_image_count: int
+    analyzed_images: list[AnalyzedImage]
     total_stored_bytes: int
     total_changed_bytes: int
     buckets: list[AttributionBucket]

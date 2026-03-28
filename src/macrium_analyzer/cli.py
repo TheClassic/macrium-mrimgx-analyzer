@@ -103,10 +103,13 @@ def _render_condensed_tree(root: DirectoryTreeNode, *, max_children: int, max_de
         for child in actual_children[:max_children]:
             label, collapsed = _collapse_directory_chain(child)
             indent = "  " * depth
-            lines.append(
+            line = (
                 f"{indent}- {label}: stored={_format_bytes(collapsed.stored_bytes)}, "
                 f"logical={_format_bytes(collapsed.changed_bytes)}, blocks={collapsed.blocks}"
             )
+            if collapsed.image_occurrences > 0:
+                line += f", images={collapsed.image_occurrences}"
+            lines.append(line)
             walk(collapsed, depth + 1)
 
     walk(root, 0)
@@ -119,37 +122,61 @@ def _render_directory_rank(
     total_stored_bytes: int,
     total_changed_bytes: int,
     top_count: int,
+    analyzed_image_count: int,
 ) -> list[str]:
     lines: list[str] = []
     for depth, node in entries[:top_count]:
         stored_share = 0.0 if total_stored_bytes == 0 else (node.stored_bytes / total_stored_bytes) * 100.0
         changed_share = 0.0 if total_changed_bytes == 0 else (node.changed_bytes / total_changed_bytes) * 100.0
-        lines.append(
+        line = (
             f"  {node.path}: stored={_format_bytes(node.stored_bytes)} "
             f"({stored_share:.1f}%), logical={_format_bytes(node.changed_bytes)} "
             f"({changed_share:.1f}%), depth={depth}, blocks={node.blocks}"
         )
+        if analyzed_image_count > 1:
+            line += f", images={node.image_occurrences}/{analyzed_image_count}"
+        lines.append(line)
     if not lines:
         lines.append("  (no directory nodes found)")
     return lines
 
 
-def _render_synthetic_section(root: DirectoryTreeNode) -> list[str]:
+def _render_synthetic_section(root: DirectoryTreeNode, *, analyzed_image_count: int) -> list[str]:
     special = next((child for child in root.children if child.kind == "synthetic-group"), None)
     if special is None:
         return ["  (no synthetic buckets)"]
     lines: list[str] = []
     for child in special.children:
-        lines.append(
+        line = (
             f"  {child.name}: stored={_format_bytes(child.stored_bytes)}, "
             f"logical={_format_bytes(child.changed_bytes)}, blocks={child.blocks}"
         )
+        if analyzed_image_count > 1:
+            line += f", images={child.image_occurrences}/{analyzed_image_count}"
+        lines.append(line)
     return lines or ["  (no synthetic buckets)"]
+
+
+def _render_analyzed_images(report: AnalysisReport) -> list[str]:
+    lines: list[str] = []
+    for image in report.analyzed_images:
+        line = (
+            f"  file #{image.file_number} ({image.backup_type})"
+            f": stored={_format_bytes(image.total_stored_bytes)}, "
+            f"logical={_format_bytes(image.total_changed_bytes)}, "
+            f"changed_blocks={image.changed_block_count}, "
+            f"buckets={image.bucket_count}"
+        )
+        if image.parent_file_number is not None:
+            line += f", parent=#{image.parent_file_number}"
+        lines.append(line)
+    return lines or ["  (no analyzed images)"]
 
 
 def _render_text_report(report: AnalysisReport, *, top_count: int) -> str:
     lines: list[str] = []
     root = report.directory_tree
+    analyzed_image_count = len(report.analyzed_images)
     largest_directories = sorted(
         _collect_directory_nodes(root),
         key=lambda item: (-item[1].stored_bytes, -item[0], item[1].path.lower()),
@@ -160,13 +187,26 @@ def _render_text_report(report: AnalysisReport, *, top_count: int) -> str:
     )
 
     lines.append(f"Target: {report.target_file}")
-    lines.append(
-        "Restore point: "
-        f"{report.target_backup_type} file #{report.target_file_number} "
-        f"(parent #{report.parent_file_number})"
-    )
-    lines.append(f"Stored bytes in target file: {_format_bytes(report.total_stored_bytes)}")
-    lines.append(f"Logical bytes covered by changed blocks: {_format_bytes(report.total_changed_bytes)}")
+    if analyzed_image_count == 1:
+        lines.append(
+            "Restore point: "
+            f"{report.target_backup_type} file #{report.target_file_number} "
+            f"(parent #{report.parent_file_number})"
+        )
+        lines.append(f"Stored bytes in analyzed file: {_format_bytes(report.total_stored_bytes)}")
+        lines.append(f"Logical bytes covered by changed blocks: {_format_bytes(report.total_changed_bytes)}")
+    else:
+        lines.append(
+            "Restore point window: "
+            f"{analyzed_image_count} image(s) ending at "
+            f"{report.target_backup_type} file #{report.target_file_number} "
+            f"(requested {report.requested_image_count})"
+        )
+        lines.append(f"Aggregate stored bytes across analyzed images: {_format_bytes(report.total_stored_bytes)}")
+        lines.append(f"Aggregate logical bytes across changed blocks: {_format_bytes(report.total_changed_bytes)}")
+        lines.append("")
+        lines.append("Analyzed restore points:")
+        lines.extend(_render_analyzed_images(report))
     lines.append("")
     lines.append("Largest directories:")
     lines.extend(
@@ -175,6 +215,7 @@ def _render_text_report(report: AnalysisReport, *, top_count: int) -> str:
             total_stored_bytes=report.total_stored_bytes,
             total_changed_bytes=report.total_changed_bytes,
             top_count=top_count,
+            analyzed_image_count=analyzed_image_count,
         )
     )
     lines.append("")
@@ -185,6 +226,7 @@ def _render_text_report(report: AnalysisReport, *, top_count: int) -> str:
             total_stored_bytes=report.total_stored_bytes,
             total_changed_bytes=report.total_changed_bytes,
             top_count=top_count,
+            analyzed_image_count=analyzed_image_count,
         )
     )
     lines.append("")
@@ -193,7 +235,7 @@ def _render_text_report(report: AnalysisReport, *, top_count: int) -> str:
     lines.extend(tree_lines if tree_lines else ["  (no directory tree nodes found)"])
     lines.append("")
     lines.append("Synthetic and unresolved buckets:")
-    lines.extend(_render_synthetic_section(root))
+    lines.extend(_render_synthetic_section(root, analyzed_image_count=analyzed_image_count))
     lines.append("")
     lines.append("Flat attribution buckets:")
     if not report.buckets:
@@ -202,11 +244,14 @@ def _render_text_report(report: AnalysisReport, *, top_count: int) -> str:
         for bucket in report.buckets[:top_count]:
             changed_share = 0.0 if report.total_changed_bytes == 0 else (bucket.changed_bytes / report.total_changed_bytes) * 100.0
             stored_share = 0.0 if report.total_stored_bytes == 0 else (bucket.stored_bytes / report.total_stored_bytes) * 100.0
-            lines.append(
+            line = (
                 f"  {bucket.key}: stored={_format_bytes(bucket.stored_bytes)} "
                 f"({stored_share:.1f}%), logical={_format_bytes(bucket.changed_bytes)} "
                 f"({changed_share:.1f}%), blocks={bucket.blocks}, ranges={bucket.changed_ranges}"
             )
+            if analyzed_image_count > 1:
+                line += f", images={bucket.image_occurrences}/{analyzed_image_count}"
+            lines.append(line)
     if report.notes:
         lines.append("")
         lines.append("Notes:")
@@ -222,6 +267,12 @@ def _add_analyze_mrimgx(subcommands: argparse._SubParsersAction[argparse.Argumen
     )
     parser.add_argument("--file", required=True, help="Path to the target .mrimgx file.")
     parser.add_argument("--top", type=int, default=20, help="How many attribution buckets to print in the text summary.")
+    parser.add_argument(
+        "--image-count",
+        type=int,
+        default=1,
+        help="How many images to analyze ending at the target file. Parent images are resolved automatically.",
+    )
     parser.add_argument(
         "--progress-file",
         help="Optional path to a JSON status file that is updated while analysis runs.",
@@ -266,6 +317,7 @@ def _handle_analyze_mrimgx(args: argparse.Namespace) -> int:
             Path(args.file),
             include_parent_ownership=bool(args.with_parent_ownership),
             progress=tracker,
+            image_count=int(args.image_count),
         )
     except Exception as exc:
         tracker.fail("Analysis failed.", error=str(exc), target_file=str(args.file))

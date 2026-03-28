@@ -94,6 +94,15 @@ class ProgressTracker:
         if isinstance(partition_index, int) and isinstance(partition_total, int):
             parts.append(f"partition={partition_index}/{partition_total}")
 
+        image_index = payload.get("image_index")
+        image_total = payload.get("image_total")
+        image_file_number = payload.get("image_file_number")
+        if isinstance(image_index, int) and isinstance(image_total, int):
+            if isinstance(image_file_number, int):
+                parts.append(f"image={image_index}/{image_total}#file{image_file_number}")
+            else:
+                parts.append(f"image={image_index}/{image_total}")
+
         changed_blocks_completed = payload.get("changed_blocks_completed")
         changed_block_total = payload.get("changed_block_total")
         if isinstance(changed_blocks_completed, int) and isinstance(changed_block_total, int):
