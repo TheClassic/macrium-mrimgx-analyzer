@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
-from .analyzer import analyze_file, report_to_json
+from .analyzer import analyze_file
 from .bootstrap import add_local_deps_to_path
-from .models import AnalysisReport, DirectoryTreeNode
 from .progress import ProgressTracker
+from .state_db import AggregateState
 from .viewer_bundle import write_viewer_bundle
 
 
@@ -51,120 +52,107 @@ def _default_viewer_output_path(output_base: Path) -> Path:
     return Path(str(output_base) + ".viewpack")
 
 
+def _default_state_db_path(output_base: Path) -> Path:
+    return Path(str(output_base) + ".state.sqlite3")
+
+
 def _default_progress_log_path(progress_file: str | None) -> Path | None:
     if not progress_file:
         return None
     return Path(str(progress_file) + ".log")
 
 
-def _collect_directory_nodes(root: DirectoryTreeNode) -> list[tuple[int, DirectoryTreeNode]]:
-    nodes: list[tuple[int, DirectoryTreeNode]] = []
-
-    def walk(node: DirectoryTreeNode, depth: int) -> None:
-        for child in node.children:
-            if child.kind == "directory":
-                nodes.append((depth + 1, child))
-                walk(child, depth + 1)
-
-    walk(root, 0)
-    return nodes
+def _depth_for_path(path: str) -> int:
+    if path == ".\\":
+        return 0
+    return len([part for part in path[2:].split("\\") if part])
 
 
-def _collect_specific_directories(root: DirectoryTreeNode) -> list[tuple[int, DirectoryTreeNode]]:
-    leaves: list[tuple[int, DirectoryTreeNode]] = []
-
-    def walk(node: DirectoryTreeNode, depth: int) -> None:
-        actual_children = [child for child in node.children if child.kind == "directory"]
-        if node.kind == "directory" and depth > 0 and not actual_children:
-            leaves.append((depth, node))
-            return
-        for child in actual_children:
-            walk(child, depth + 1)
-
-    walk(root, 0)
-    return leaves
+def _share(value: float, total: int) -> float:
+    if total == 0:
+        return 0.0
+    return (value / total) * 100.0
 
 
-def _collapse_directory_chain(node: DirectoryTreeNode) -> tuple[str, DirectoryTreeNode]:
-    parts = [node.name]
+def _collapse_directory_chain(state: AggregateState, node: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    parts = [str(node["name"])]
     current = node
     while True:
-        actual_children = [child for child in current.children if child.kind == "directory"]
-        synthetic_children = [child for child in current.children if child.kind != "directory"]
-        if len(actual_children) != 1 or synthetic_children:
+        actual_children = state.load_directory_children(str(current["path"]), limit=2)
+        if len(actual_children) != 1:
             break
         current = actual_children[0]
-        parts.append(current.name)
+        parts.append(str(current["name"]))
     return "\\".join(parts), current
 
 
-def _render_condensed_tree(root: DirectoryTreeNode, *, max_children: int, max_depth: int) -> list[str]:
+def _render_condensed_tree(state: AggregateState, *, max_children: int, max_depth: int) -> list[str]:
     lines: list[str] = []
 
-    def walk(node: DirectoryTreeNode, depth: int) -> None:
+    def walk(path: str, depth: int) -> None:
         if depth >= max_depth:
             return
-        actual_children = [child for child in node.children if child.kind == "directory"]
-        for child in actual_children[:max_children]:
-            label, collapsed = _collapse_directory_chain(child)
+        children = state.load_directory_children(path, limit=max_children)
+        for child in children:
+            label, collapsed = _collapse_directory_chain(state, child)
             indent = "  " * depth
             line = (
-                f"{indent}- {label}: stored={_format_bytes(collapsed.stored_bytes)}, "
-                f"logical={_format_bytes(collapsed.changed_bytes)}, blocks={collapsed.blocks}"
+                f"{indent}- {label}: stored={_format_bytes(float(collapsed['stored_bytes']))}, "
+                f"logical={_format_bytes(int(collapsed['changed_bytes']))}, blocks={int(collapsed['blocks'])}"
             )
-            if collapsed.image_occurrences > 0:
-                line += f", images={collapsed.image_occurrences}"
+            if int(collapsed["image_occurrences"]) > 0:
+                line += f", images={int(collapsed['image_occurrences'])}"
             lines.append(line)
-            walk(collapsed, depth + 1)
+            walk(str(collapsed["path"]), depth + 1)
 
-    walk(root, 0)
+    walk(".\\", 0)
     return lines
 
 
 def _render_directory_rank(
-    entries: list[tuple[int, DirectoryTreeNode]],
+    entries: list[dict[str, Any]],
     *,
     total_stored_bytes: int,
     total_changed_bytes: int,
-    top_count: int,
     analyzed_image_count: int,
 ) -> list[str]:
     lines: list[str] = []
-    for depth, node in entries[:top_count]:
-        stored_share = 0.0 if total_stored_bytes == 0 else (node.stored_bytes / total_stored_bytes) * 100.0
-        changed_share = 0.0 if total_changed_bytes == 0 else (node.changed_bytes / total_changed_bytes) * 100.0
+    for node in entries:
+        stored_bytes = float(node["stored_bytes"])
+        changed_bytes = int(node["changed_bytes"])
         line = (
-            f"  {node.path}: stored={_format_bytes(node.stored_bytes)} "
-            f"({stored_share:.1f}%), logical={_format_bytes(node.changed_bytes)} "
-            f"({changed_share:.1f}%), depth={depth}, blocks={node.blocks}"
+            f"  {node['path']}: stored={_format_bytes(stored_bytes)} "
+            f"({_share(stored_bytes, total_stored_bytes):.1f}%), "
+            f"logical={_format_bytes(changed_bytes)} "
+            f"({_share(changed_bytes, total_changed_bytes):.1f}%), "
+            f"depth={_depth_for_path(str(node['path']))}, blocks={int(node['blocks'])}"
         )
         if analyzed_image_count > 1:
-            line += f", images={node.image_occurrences}/{analyzed_image_count}"
+            line += f", images={int(node['image_occurrences'])}/{analyzed_image_count}"
         lines.append(line)
-    if not lines:
-        lines.append("  (no directory nodes found)")
+    return lines or ["  (no directory nodes found)"]
+
+
+def _render_synthetic_section(state: AggregateState, *, analyzed_image_count: int) -> list[str]:
+    entries = state.load_special_entries()
+    if not entries:
+        return ["  (no synthetic buckets)"]
+
+    lines: list[str] = []
+    for entry in entries:
+        line = (
+            f"  {entry['key']}: stored={_format_bytes(float(entry['stored_bytes']))}, "
+            f"logical={_format_bytes(int(entry['changed_bytes']))}, blocks={int(entry['blocks'])}"
+        )
+        if analyzed_image_count > 1:
+            line += f", images={int(entry['image_occurrences'])}/{analyzed_image_count}"
+        lines.append(line)
     return lines
 
 
-def _render_synthetic_section(root: DirectoryTreeNode, *, analyzed_image_count: int) -> list[str]:
-    special = next((child for child in root.children if child.kind == "synthetic-group"), None)
-    if special is None:
-        return ["  (no synthetic buckets)"]
+def _render_analyzed_images(state: AggregateState) -> list[str]:
     lines: list[str] = []
-    for child in special.children:
-        line = (
-            f"  {child.name}: stored={_format_bytes(child.stored_bytes)}, "
-            f"logical={_format_bytes(child.changed_bytes)}, blocks={child.blocks}"
-        )
-        if analyzed_image_count > 1:
-            line += f", images={child.image_occurrences}/{analyzed_image_count}"
-        lines.append(line)
-    return lines or ["  (no synthetic buckets)"]
-
-
-def _render_analyzed_images(report: AnalysisReport) -> list[str]:
-    lines: list[str] = []
-    for image in report.analyzed_images:
+    for image in state.load_analyzed_images():
         line = (
             f"  file #{image.file_number} ({image.backup_type})"
             f": stored={_format_bytes(image.total_stored_bytes)}, "
@@ -178,91 +166,100 @@ def _render_analyzed_images(report: AnalysisReport) -> list[str]:
     return lines or ["  (no analyzed images)"]
 
 
-def _render_text_report(report: AnalysisReport, *, top_count: int) -> str:
-    lines: list[str] = []
-    root = report.directory_tree
-    analyzed_image_count = len(report.analyzed_images)
-    largest_directories = sorted(
-        _collect_directory_nodes(root),
-        key=lambda item: (-item[1].stored_bytes, -item[0], item[1].path.lower()),
-    )
-    specific_directories = sorted(
-        _collect_specific_directories(root),
-        key=lambda item: (-item[1].stored_bytes, -item[0], item[1].path.lower()),
-    )
+def _render_text_report(state: AggregateState, *, top_count: int) -> str:
+    summary = state.load_run_summary()
+    analyzed_image_count = int(summary["analyzed_image_count"])
+    total_stored_bytes = int(summary["total_stored_bytes"])
+    total_changed_bytes = int(summary["total_changed_bytes"])
 
-    lines.append(f"Target: {report.target_file}")
+    lines: list[str] = []
+    lines.append(f"Target: {summary['target_file']}")
     if analyzed_image_count == 1:
         lines.append(
             "Restore point: "
-            f"{report.target_backup_type} file #{report.target_file_number} "
-            f"(parent #{report.parent_file_number})"
+            f"{summary['target_backup_type']} file #{summary['target_file_number']} "
+            f"(parent #{summary['parent_file_number']})"
         )
-        lines.append(f"Stored bytes in analyzed file: {_format_bytes(report.total_stored_bytes)}")
-        lines.append(f"Logical bytes covered by changed blocks: {_format_bytes(report.total_changed_bytes)}")
+        lines.append(f"Stored bytes in analyzed file: {_format_bytes(total_stored_bytes)}")
+        lines.append(f"Logical bytes covered by changed blocks: {_format_bytes(total_changed_bytes)}")
     else:
         lines.append(
             "Restore point window: "
             f"{analyzed_image_count} image(s) ending at "
-            f"{report.target_backup_type} file #{report.target_file_number} "
-            f"(requested {report.requested_image_count})"
+            f"{summary['target_backup_type']} file #{summary['target_file_number']} "
+            f"(requested {summary['requested_image_count']})"
         )
-        lines.append(f"Aggregate stored bytes across analyzed images: {_format_bytes(report.total_stored_bytes)}")
-        lines.append(f"Aggregate logical bytes across changed blocks: {_format_bytes(report.total_changed_bytes)}")
+        lines.append(f"Aggregate stored bytes across analyzed images: {_format_bytes(total_stored_bytes)}")
+        lines.append(f"Aggregate logical bytes across changed blocks: {_format_bytes(total_changed_bytes)}")
         lines.append("")
         lines.append("Analyzed restore points:")
-        lines.extend(_render_analyzed_images(report))
+        lines.extend(_render_analyzed_images(state))
+
     lines.append("")
     lines.append("Largest directories:")
     lines.extend(
         _render_directory_rank(
-            largest_directories,
-            total_stored_bytes=report.total_stored_bytes,
-            total_changed_bytes=report.total_changed_bytes,
-            top_count=top_count,
+            state.load_top_directories(top_count),
+            total_stored_bytes=total_stored_bytes,
+            total_changed_bytes=total_changed_bytes,
             analyzed_image_count=analyzed_image_count,
         )
     )
+
     lines.append("")
     lines.append("Most specific impactful directories:")
     lines.extend(
         _render_directory_rank(
-            specific_directories,
-            total_stored_bytes=report.total_stored_bytes,
-            total_changed_bytes=report.total_changed_bytes,
-            top_count=top_count,
+            state.load_top_leaf_directories(top_count),
+            total_stored_bytes=total_stored_bytes,
+            total_changed_bytes=total_changed_bytes,
             analyzed_image_count=analyzed_image_count,
         )
     )
+
     lines.append("")
     lines.append("Condensed directory tree:")
-    tree_lines = _render_condensed_tree(root, max_children=3, max_depth=4)
+    tree_lines = _render_condensed_tree(state, max_children=3, max_depth=4)
     lines.extend(tree_lines if tree_lines else ["  (no directory tree nodes found)"])
+
     lines.append("")
     lines.append("Synthetic and unresolved buckets:")
-    lines.extend(_render_synthetic_section(root, analyzed_image_count=analyzed_image_count))
+    lines.extend(_render_synthetic_section(state, analyzed_image_count=analyzed_image_count))
+
     lines.append("")
     lines.append("Flat attribution buckets:")
-    if not report.buckets:
+    buckets = state.load_flat_buckets(limit=top_count)
+    if not buckets:
         lines.append("  (no changed buckets found)")
     else:
-        for bucket in report.buckets[:top_count]:
-            changed_share = 0.0 if report.total_changed_bytes == 0 else (bucket.changed_bytes / report.total_changed_bytes) * 100.0
-            stored_share = 0.0 if report.total_stored_bytes == 0 else (bucket.stored_bytes / report.total_stored_bytes) * 100.0
+        for bucket in buckets:
+            changed_bytes = int(bucket["changed_bytes"])
+            stored_bytes = float(bucket["stored_bytes"])
             line = (
-                f"  {bucket.key}: stored={_format_bytes(bucket.stored_bytes)} "
-                f"({stored_share:.1f}%), logical={_format_bytes(bucket.changed_bytes)} "
-                f"({changed_share:.1f}%), blocks={bucket.blocks}, ranges={bucket.changed_ranges}"
+                f"  {bucket['key']}: stored={_format_bytes(stored_bytes)} "
+                f"({_share(stored_bytes, total_stored_bytes):.1f}%), "
+                f"logical={_format_bytes(changed_bytes)} "
+                f"({_share(changed_bytes, total_changed_bytes):.1f}%), "
+                f"blocks={int(bucket['blocks'])}, ranges={int(bucket['changed_ranges'])}"
             )
             if analyzed_image_count > 1:
-                line += f", images={bucket.image_occurrences}/{analyzed_image_count}"
+                line += f", images={int(bucket['image_occurrences'])}/{analyzed_image_count}"
             lines.append(line)
-    if report.notes:
+
+    notes = state.load_notes()
+    if notes:
         lines.append("")
         lines.append("Notes:")
-        for note in report.notes:
+        for note in notes:
             lines.append(f"  - {note}")
     return "\n".join(lines) + "\n"
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path.write_text(content, encoding="utf-8")
+    temp_path.replace(path)
 
 
 def _add_analyze_mrimgx(subcommands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -288,7 +285,11 @@ def _add_analyze_mrimgx(subcommands: argparse._SubParsersAction[argparse.Argumen
     )
     parser.add_argument(
         "--output-base",
-        help="Base path for durable report files. The CLI always writes <base>.txt and by default also writes <base>.json and <base>.viewpack. Defaults to <target-stem>.analysis in the working directory.",
+        help="Base path for durable report files. The CLI always writes <base>.txt, <base>.state.sqlite3, and by default also writes <base>.json and <base>.viewpack. Defaults to <target-stem>.analysis in the working directory.",
+    )
+    parser.add_argument(
+        "--state-db",
+        help="Optional path for the canonical SQLite aggregate state. Defaults to <output-base>.state.sqlite3.",
     )
     parser.add_argument(
         "--viewer-output",
@@ -331,57 +332,94 @@ def _handle_analyze_mrimgx(args: argparse.Namespace) -> int:
         path=Path(args.progress_file) if args.progress_file else None,
         log_path=log_path,
     )
+
+    top_count = max(args.top, 0)
+    output_base = Path(args.output_base) if args.output_base else _default_output_base(args.file)
+    json_path, text_path = _output_paths(output_base)
+    state_db_path = Path(args.state_db) if args.state_db else _default_state_db_path(output_base)
+    viewer_output_path = Path(args.viewer_output) if args.viewer_output else _default_viewer_output_path(output_base)
+
     try:
-        report = analyze_file(
+        analyze_file(
             Path(args.file),
+            state_db_path=state_db_path,
             include_parent_ownership=bool(args.with_parent_ownership),
             progress=tracker,
             image_count=int(args.image_count),
         )
     except Exception as exc:
-        tracker.fail("Analysis failed.", error=str(exc), target_file=str(args.file))
+        tracker.fail(
+            "Analysis failed.",
+            error=str(exc),
+            target_file=str(args.file),
+            state_db_file=str(state_db_path),
+        )
         raise
 
-    top_count = max(args.top, 0)
-    output_base = Path(args.output_base) if args.output_base else _default_output_base(args.file)
-    json_path, text_path = _output_paths(output_base)
-    viewer_output_path = Path(args.viewer_output) if args.viewer_output else _default_viewer_output_path(output_base)
-    json_text = report_to_json(report)
-    text_report = _render_text_report(report, top_count=top_count)
-    text_path.write_text(text_report, encoding="utf-8")
-    if not args.no_json_output:
-        json_path.write_text(json_text + "\n", encoding="utf-8")
-    if not args.no_viewer_output:
-        write_viewer_bundle(report, viewer_output_path)
-    tracker.finish(
-        phase="done",
-        message="Analysis complete.",
-        output_text_file=str(text_path),
-        output_json_file=(str(json_path) if not args.no_json_output else None),
-        output_viewer_file=(str(viewer_output_path) if not args.no_viewer_output else None),
-    )
+    state = AggregateState.open(state_db_path)
+    try:
+        tracker.update(
+            "write-text",
+            "Writing text report.",
+            state_db_file=str(state_db_path),
+        )
+        text_report = _render_text_report(state, top_count=top_count)
+        _atomic_write_text(text_path, text_report)
 
-    elapsed_seconds = None
-    if tracker.path and tracker.path.exists():
-        try:
-            payload = json.loads(tracker.path.read_text(encoding="utf-8"))
-            elapsed_seconds = payload.get("elapsed_seconds")
-        except Exception:
-            elapsed_seconds = None
+        if not args.no_json_output:
+            tracker.update(
+                "write-json",
+                "Writing compact JSON report.",
+                state_db_file=str(state_db_path),
+            )
+            state.write_json_report(json_path)
 
-    if args.json:
-        print(json_text)
-    else:
-        print(text_report, end="")
-    print(f"Text report written to: {text_path}")
-    if not args.no_json_output:
-        print(f"JSON report written to: {json_path}")
-    if not args.no_viewer_output:
-        print(f"Viewer bundle written to: {viewer_output_path}")
-    if log_path is not None:
-        print(f"Progress log written to: {log_path}")
-    if isinstance(elapsed_seconds, (int, float)):
-        print(f"Elapsed time: {_format_duration(float(elapsed_seconds))}")
+        if not args.no_viewer_output:
+            tracker.update(
+                "write-viewpack",
+                "Writing viewer bundle.",
+                state_db_file=str(state_db_path),
+            )
+            write_viewer_bundle(state, viewer_output_path)
+
+        tracker.finish(
+            phase="done",
+            message="Analysis complete.",
+            output_text_file=str(text_path),
+            output_json_file=(str(json_path) if not args.no_json_output else None),
+            output_viewer_file=(str(viewer_output_path) if not args.no_viewer_output else None),
+            state_db_file=str(state_db_path),
+        )
+
+        elapsed_seconds = None
+        if tracker.path and tracker.path.exists():
+            try:
+                payload = json.loads(tracker.path.read_text(encoding="utf-8"))
+                elapsed_seconds = payload.get("elapsed_seconds")
+            except Exception:
+                elapsed_seconds = None
+
+        if args.json:
+            if args.no_json_output:
+                state.write_json_report_to_handle(sys.stdout)
+                print()
+            else:
+                sys.stdout.write(json_path.read_text(encoding="utf-8"))
+                sys.stdout.write("\n")
+        else:
+            print(text_report, end="")
+        print(f"Text report written to: {text_path}")
+        if not args.no_json_output:
+            print(f"JSON report written to: {json_path}")
+        if not args.no_viewer_output:
+            print(f"Viewer bundle written to: {viewer_output_path}")
+        print(f"State database written to: {state_db_path}")
+        if log_path is not None:
+            print(f"Progress log written to: {log_path}")
+        if isinstance(elapsed_seconds, (int, float)):
+            print(f"Elapsed time: {_format_duration(float(elapsed_seconds))}")
+    finally:
+        state.close()
     return 0
 
 

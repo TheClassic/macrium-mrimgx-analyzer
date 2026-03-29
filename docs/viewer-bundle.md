@@ -1,24 +1,26 @@
-# Viewer Bundle Milestone
+# Viewer Bundle Design
 
 ## Summary
 
-The current full `.analysis.json` remains the audit/debug output, but it is not intended to be the primary interactive format for very large reports. A future viewer milestone should add a viewer-oriented single-file indexed bundle, such as `.viewpack`, plus a committed static local HTML viewer.
+The compact `.analysis.json` remains an audit/debug output, but it is not intended to be the primary interactive format for very large reports. The interactive path is a viewer-oriented single-file indexed bundle, `.viewpack`, plus the committed static local HTML viewer.
 
 ## Why Not Use Giant JSON Directly
 
-- Large analysis JSON files are too expensive to parse in-browser for smooth drill-down at larger sizes.
+- Even compact analysis JSON files are still the wrong primary format for browser drill-down at larger sizes.
 - A static local viewer with a file picker is still the desired user experience.
 - A single indexed bundle works better than a shard directory for `file://` usage because the viewer can open one file and read subtrees from known offsets.
+- The analyzer's canonical state is SQLite, not JSON. The viewer bundle is derived from SQLite after rollups are finalized.
 
 ## Planned Output Set
 
-Future analysis runs should be able to write:
+Analysis runs write:
 
 - text report
 - full JSON report
+- SQLite aggregate-state database
 - viewer bundle
 
-For the first viewer milestone, both JSON and viewer bundle are expected to be enabled by default, with separate disable flags.
+JSON and viewer bundle are both enabled by default, with separate disable flags. The SQLite state database is always written unless a future option explicitly changes that policy.
 
 ## Planned Viewer Behavior
 
