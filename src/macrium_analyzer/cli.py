@@ -11,6 +11,7 @@ from .analyzer import analyze_file, report_to_json
 from .bootstrap import add_local_deps_to_path
 from .models import AnalysisReport, DirectoryTreeNode
 from .progress import ProgressTracker
+from .viewer_bundle import write_viewer_bundle
 
 
 def _format_bytes(value: float) -> str:
@@ -44,6 +45,10 @@ def _default_output_base(target_file: str) -> Path:
 def _output_paths(output_base: Path) -> tuple[Path, Path]:
     base_text = str(output_base)
     return Path(base_text + ".json"), Path(base_text + ".txt")
+
+
+def _default_viewer_output_path(output_base: Path) -> Path:
+    return Path(str(output_base) + ".viewpack")
 
 
 def _default_progress_log_path(progress_file: str | None) -> Path | None:
@@ -283,7 +288,21 @@ def _add_analyze_mrimgx(subcommands: argparse._SubParsersAction[argparse.Argumen
     )
     parser.add_argument(
         "--output-base",
-        help="Base path for durable report files. The CLI writes both <base>.json and <base>.txt. Defaults to <target-stem>.analysis in the working directory.",
+        help="Base path for durable report files. The CLI always writes <base>.txt and by default also writes <base>.json and <base>.viewpack. Defaults to <target-stem>.analysis in the working directory.",
+    )
+    parser.add_argument(
+        "--viewer-output",
+        help="Optional path for the viewer bundle output. Defaults to <output-base>.viewpack.",
+    )
+    parser.add_argument(
+        "--no-json-output",
+        action="store_true",
+        help="Do not write the durable JSON report file.",
+    )
+    parser.add_argument(
+        "--no-viewer-output",
+        action="store_true",
+        help="Do not write the durable viewer bundle file.",
     )
     parser.add_argument(
         "--with-parent-ownership",
@@ -326,15 +345,20 @@ def _handle_analyze_mrimgx(args: argparse.Namespace) -> int:
     top_count = max(args.top, 0)
     output_base = Path(args.output_base) if args.output_base else _default_output_base(args.file)
     json_path, text_path = _output_paths(output_base)
+    viewer_output_path = Path(args.viewer_output) if args.viewer_output else _default_viewer_output_path(output_base)
     json_text = report_to_json(report)
     text_report = _render_text_report(report, top_count=top_count)
-    json_path.write_text(json_text + "\n", encoding="utf-8")
     text_path.write_text(text_report, encoding="utf-8")
+    if not args.no_json_output:
+        json_path.write_text(json_text + "\n", encoding="utf-8")
+    if not args.no_viewer_output:
+        write_viewer_bundle(report, viewer_output_path)
     tracker.finish(
         phase="done",
         message="Analysis complete.",
-        output_json_file=str(json_path),
         output_text_file=str(text_path),
+        output_json_file=(str(json_path) if not args.no_json_output else None),
+        output_viewer_file=(str(viewer_output_path) if not args.no_viewer_output else None),
     )
 
     elapsed_seconds = None
@@ -349,8 +373,11 @@ def _handle_analyze_mrimgx(args: argparse.Namespace) -> int:
         print(json_text)
     else:
         print(text_report, end="")
-    print(f"JSON report written to: {json_path}")
     print(f"Text report written to: {text_path}")
+    if not args.no_json_output:
+        print(f"JSON report written to: {json_path}")
+    if not args.no_viewer_output:
+        print(f"Viewer bundle written to: {viewer_output_path}")
     if log_path is not None:
         print(f"Progress log written to: {log_path}")
     if isinstance(elapsed_seconds, (int, float)):

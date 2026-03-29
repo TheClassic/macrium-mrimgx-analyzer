@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Macrium Analyzer Viewer</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <header class="hero">
+    <div>
+      <h1>Macrium Analyzer Viewer</h1>
+      <p>Open a <code>.viewpack</code> bundle and drill into directories and files without loading the whole report tree up front.</p>
+    </div>
+    <label class="file-picker">
+      <span>Open Viewer Bundle</span>
+      <input id="bundle-input" type="file" accept=".viewpack,application/octet-stream">
+    </label>
+  </header>
+
+  <main class="layout">
+    <section class="panel overview-panel">
+      <h2>Overview</h2>
+      <div id="overview-empty" class="muted">Choose a <code>.viewpack</code> file to begin.</div>
+      <div id="overview-content" hidden>
+        <dl id="overview-grid" class="overview-grid"></dl>
+        <h3>Analyzed Images</h3>
+        <div id="overview-images" class="overview-images"></div>
+        <h3>Notes</h3>
+        <ul id="overview-notes" class="notes-list"></ul>
+      </div>
+    </section>
+
+    <section class="panel tree-panel">
+      <div class="panel-header">
+        <h2>Tree</h2>
+        <div id="load-status" class="status muted">Waiting for bundle.</div>
+      </div>
+      <div id="tree-root" class="tree-root"></div>
+      <section class="special-section">
+        <button id="special-toggle" class="special-toggle" type="button" disabled>
+          Show Synthetic And Metadata Buckets
+        </button>
+        <div id="special-container" class="special-container" hidden></div>
+      </section>
+    </section>
+
+    <section class="panel detail-panel">
+      <h2>Details</h2>
+      <div id="detail-empty" class="muted">Select a directory, file, or special bucket to inspect its metrics.</div>
+      <div id="detail-content" hidden>
+        <h3 id="detail-title"></h3>
+        <dl id="detail-grid" class="detail-grid"></dl>
+      </div>
+    </section>
+  </main>
+
+  <script src="./app.js"></script>
+</body>
+</html>

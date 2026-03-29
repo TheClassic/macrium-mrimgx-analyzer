@@ -74,6 +74,6 @@ This repo does not vendor the upstream Macrium format-reference project.
 
 ## Roadmap
 
-- dynamic expandable viewer over the persisted directory-tree JSON
+- static local HTML viewer backed by a `.viewpack`-style indexed bundle for dynamic drill-down
 - multi-image analysis to identify recurring contributors across a backup chain
 - deeper handling for metadata-heavy NTFS buckets such as `$MFT`, `$LogFile`, and `$UsnJrnl`
