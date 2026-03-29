@@ -87,5 +87,6 @@ This repo does not vendor the upstream Macrium format-reference project.
 ## Roadmap
 
 - resumable analysis built on top of the SQLite state database
+- performance and parallel-processing design work for faster large-chain analysis
 - richer viewer drill-down and search within the local static HTML viewer
 - deeper handling for metadata-heavy NTFS buckets such as `$MFT`, `$LogFile`, and `$UsnJrnl`

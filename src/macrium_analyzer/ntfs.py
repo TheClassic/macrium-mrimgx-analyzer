@@ -14,6 +14,11 @@ ATTRIBUTE_FILE_NAME = 0x30
 ATTRIBUTE_DATA = 0x80
 ATTRIBUTE_INDEX_ALLOCATION = 0xA0
 
+FILE_NAME_NAMESPACE_POSIX = 0
+FILE_NAME_NAMESPACE_WIN32 = 1
+FILE_NAME_NAMESPACE_DOS = 2
+FILE_NAME_NAMESPACE_WIN32_AND_DOS = 3
+
 
 @dataclass
 class ParsedAttribute:
@@ -23,6 +28,13 @@ class ParsedAttribute:
     content: bytes | None
     runlist: list[tuple[int | None, int]]
     real_size: int
+
+
+@dataclass(frozen=True)
+class ParsedFileName:
+    name: str
+    parent_record_number: int
+    namespace: int
 
 
 class NtfsMapper:
@@ -186,7 +198,7 @@ class NtfsMapper:
         base_record = base_record_ref & 0xFFFFFFFFFFFF
         is_directory = bool(flags & 0x02)
         offset = first_attr_offset
-        file_name: tuple[str, int] | None = None
+        file_names: list[ParsedFileName] = []
         attributes: list[ParsedAttribute] = []
         while offset + 8 <= len(fixed):
             attribute_type, length = struct.unpack_from("<II", fixed, offset)
@@ -217,10 +229,10 @@ class NtfsMapper:
                 value_length = struct.unpack_from("<I", fixed, offset + 16)[0]
                 value_offset = struct.unpack_from("<H", fixed, offset + 20)[0]
                 content = fixed[offset + value_offset : offset + value_offset + value_length]
-                if attribute_type == ATTRIBUTE_FILE_NAME and file_name is None:
+                if attribute_type == ATTRIBUTE_FILE_NAME:
                     candidate = self._parse_file_name(content)
                     if candidate is not None:
-                        file_name = candidate
+                        file_names.append(candidate)
                 attributes.append(
                     ParsedAttribute(
                         attribute_type=attribute_type,
@@ -236,19 +248,42 @@ class NtfsMapper:
             "base_record": base_record,
             "in_use": True,
             "is_directory": is_directory,
-            "file_name": file_name,
+            "file_name": self._select_preferred_file_name(file_names),
             "attributes": attributes,
         }
 
-    def _parse_file_name(self, content: bytes) -> tuple[str, int] | None:
+    def _parse_file_name(self, content: bytes) -> ParsedFileName | None:
         if len(content) < 66:
             return None
         parent_ref = struct.unpack_from("<Q", content, 0)[0]
         parent_record_number = parent_ref & 0xFFFFFFFFFFFF
         name_length = content[64]
+        namespace = content[65]
         raw_name = content[66 : 66 + (name_length * 2)]
         name = raw_name.decode("utf-16le", errors="replace")
-        return name, int(parent_record_number)
+        return ParsedFileName(
+            name=name,
+            parent_record_number=int(parent_record_number),
+            namespace=namespace,
+        )
+
+    def _select_preferred_file_name(self, file_names: list[ParsedFileName]) -> tuple[str, int] | None:
+        if not file_names:
+            return None
+        preferred = min(
+            enumerate(file_names),
+            key=lambda item: (self._file_name_namespace_priority(item[1].namespace), item[0]),
+        )[1]
+        return preferred.name, preferred.parent_record_number
+
+    def _file_name_namespace_priority(self, namespace: int) -> int:
+        if namespace in (FILE_NAME_NAMESPACE_WIN32, FILE_NAME_NAMESPACE_WIN32_AND_DOS):
+            return 0
+        if namespace == FILE_NAME_NAMESPACE_POSIX:
+            return 1
+        if namespace == FILE_NAME_NAMESPACE_DOS:
+            return 2
+        return 3
 
     def _parse_runlist(self, payload: bytes) -> list[tuple[int | None, int]]:
         runs: list[tuple[int | None, int]] = []

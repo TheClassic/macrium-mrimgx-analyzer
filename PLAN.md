@@ -47,6 +47,14 @@ This design replaces the older "build one giant in-memory report and serialize i
 - Extend recurring-contributor analysis to reason about rename and move behavior across a chain.
 - Keep the rename/move identity question explicitly open until we decide how strongly to couple history to path vs NTFS identity.
 
+### Performance And Parallel Processing
+
+- Investigate faster execution for large single-image and multi-image runs without undoing the SQLite aggregate-state design.
+- Evaluate process-level parallelism across images or partitions rather than naive Python threading in the per-block hot path.
+- Measure where time is currently spent between NTFS map building, changed-block attribution, SQLite aggregation, and output generation.
+- Consider additional optimizations such as larger aggregate flush batches, cheaper overlap lookup paths, and more targeted mapper work.
+- Keep the design phase explicit before implementation so we choose the right concurrency model and avoid introducing SQLite writer contention or wasted Python-thread overhead.
+
 ## Validation
 
 - Verify single-image and multi-image runs both produce `.txt`, `.json`, `.viewpack`, and `.state.sqlite3`.
