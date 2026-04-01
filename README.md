@@ -34,26 +34,16 @@ python -m pip install -e .
 
 ```powershell
 macrium-analyzer analyze-mrimgx `
-  --file "D:\Backups\example.mrimgx" `
+  --file "D:\Backups\34EEA0E7CD73CF00-24-24.mrimgx" `
   --image-count 4 `
-  --progress-file ".\run-status.json" `
-  --output-base ".\example.analysis"
 ```
 
-3. Review the durable outputs written to disk:
+3. Launch the html viewer and load the viewpack:
 
-- `example.analysis.json`
-- `example.analysis.txt`
-- `example.analysis.viewpack`
-- `example.analysis.state.sqlite3`
-- `run-status.json`
-- `run-status.json.log`
+- `viewer\index.html`
+- `34EEA0E7CD73CF00-24-24.analysis.viewpack`
 
-4. Tail the append-only progress log while the analysis runs:
-
-```powershell
-Get-Content ".\run-status.json.log" -Wait
-```
+![Screenshot](docs/screenshot.png)
 
 ## Output Shape
 
