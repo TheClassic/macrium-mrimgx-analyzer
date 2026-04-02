@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -100,31 +99,38 @@ def _parse_image_numbers(value: str | None) -> list[int]:
 
 
 class AggregateState:
-    def __init__(self, path: Path, connection: sqlite3.Connection) -> None:
+    def __init__(self, path: Path | None, connection: sqlite3.Connection, *, db_label: str) -> None:
         self.path = path
+        self.db_label = db_label
         self.connection = connection
         self.connection.row_factory = sqlite3.Row
 
     @classmethod
     def create(
         cls,
-        path: Path,
+        path: Path | None,
         *,
         target_file: Path,
         target_file_number: int,
         target_backup_type: str,
         parent_file_number: int | None,
         requested_image_count: int,
+        in_memory: bool = False,
     ) -> "AggregateState":
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.unlink(missing_ok=True)
-        for suffix in (".shm", ".wal"):
-            sidecar = Path(str(path) + suffix)
-            if sidecar.exists():
-                sidecar.unlink()
-
-        connection = sqlite3.connect(path)
-        state = cls(path, connection)
+        if in_memory:
+            connection = sqlite3.connect(":memory:")
+            state = cls(None, connection, db_label=":memory:")
+        else:
+            if path is None:
+                raise ValueError("A state database path is required when not using in-memory mode.")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.unlink(missing_ok=True)
+            for suffix in (".shm", ".wal", ".journal"):
+                sidecar = Path(str(path) + suffix)
+                if sidecar.exists():
+                    sidecar.unlink()
+            connection = sqlite3.connect(path)
+            state = cls(path, connection, db_label=str(path))
         state._configure_connection()
         state._create_schema()
         state.connection.execute(
@@ -154,7 +160,7 @@ class AggregateState:
     @classmethod
     def open(cls, path: Path) -> "AggregateState":
         connection = sqlite3.connect(path)
-        state = cls(path, connection)
+        state = cls(path, connection, db_label=str(path))
         state._configure_connection()
         return state
 
@@ -635,80 +641,6 @@ class AggregateState:
         )
         for row in cursor:
             yield self._directory_row_to_dict(row)
-
-    def write_json_report(self, destination: Path) -> Path:
-        temp_path = destination.with_suffix(destination.suffix + ".tmp")
-        temp_path.parent.mkdir(parents=True, exist_ok=True)
-        with temp_path.open("w", encoding="utf-8") as handle:
-            self.write_json_report_to_handle(handle)
-            handle.write("\n")
-        temp_path.replace(destination)
-        return destination
-
-    def write_json_report_to_handle(self, handle: Any) -> None:
-        summary = self.load_run_summary()
-        handle.write("{\n")
-        handle.write('  "format": "macrium-analysis",\n')
-        handle.write(f'  "version": {int(summary["format_version"])},\n')
-        handle.write('  "summary": ')
-        json.dump(
-            {
-                "target_file": summary["target_file"],
-                "target_file_number": int(summary["target_file_number"]),
-                "target_backup_type": summary["target_backup_type"],
-                "parent_file_number": (
-                    None if summary["parent_file_number"] is None else int(summary["parent_file_number"])
-                ),
-                "requested_image_count": int(summary["requested_image_count"]),
-                "analyzed_image_count": int(summary["analyzed_image_count"]),
-                "total_stored_bytes": int(summary["total_stored_bytes"]),
-                "total_changed_bytes": int(summary["total_changed_bytes"]),
-                "bucket_count": int(summary["bucket_count"]),
-                "state_db": str(self.path),
-            },
-            handle,
-            indent=2,
-        )
-        handle.write(",\n")
-        self._write_json_array(
-            handle,
-            "analyzed_images",
-            (
-                {
-                    "file_path": str(image.file_path),
-                    "file_number": image.file_number,
-                    "backup_type": image.backup_type,
-                    "parent_file_number": image.parent_file_number,
-                    "total_stored_bytes": image.total_stored_bytes,
-                    "total_changed_bytes": image.total_changed_bytes,
-                    "changed_block_count": image.changed_block_count,
-                    "bucket_count": image.bucket_count,
-                }
-                for image in self.load_analyzed_images()
-            ),
-        )
-        handle.write(",\n")
-        self._write_json_array(handle, "directories", self.iter_all_directories())
-        handle.write(",\n")
-        self._write_json_array(handle, "files", self.iter_all_file_entries())
-        handle.write(",\n")
-        self._write_json_array(handle, "special_buckets", self.load_special_entries())
-        handle.write(",\n")
-        self._write_json_array(handle, "notes", self.load_notes())
-        handle.write("\n}\n")
-
-    def _write_json_array(self, handle: Any, key: str, values: Iterable[Any]) -> None:
-        handle.write(f'  "{key}": [\n')
-        first = True
-        for value in values:
-            if not first:
-                handle.write(",\n")
-            handle.write("    ")
-            json.dump(value, handle, ensure_ascii=True)
-            first = False
-        if not first:
-            handle.write("\n")
-        handle.write("  ]")
 
     def _directory_select(self, *, where_clause: str, order_clause: str, limit: int | None = None) -> str:
         limit_clause = "" if limit is None else " LIMIT ?"

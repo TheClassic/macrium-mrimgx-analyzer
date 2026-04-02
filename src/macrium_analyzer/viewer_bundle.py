@@ -203,7 +203,7 @@ def write_viewer_bundle(state: AggregateState, destination: Path) -> Path:
                 if special_ref is not None
                 else None
             ),
-            "state_db": str(state.path),
+            "state_db": state.db_label,
         }
 
         manifest_bytes = json.dumps(manifest, separators=(",", ":"), ensure_ascii=True).encode("utf-8")

@@ -131,7 +131,7 @@ def _analyze_single_restore_point(
             changed_block_total=len(changed_block_indexes),
             progress_completed=analyzed_blocks_completed,
             progress_total=total_changed_block_count,
-            state_db_path=str(state.path),
+            state_db_path=state.db_label,
         )
 
         current_mapper = None
@@ -149,7 +149,7 @@ def _analyze_single_restore_point(
                 partition_number=source.partition_number,
                 progress_completed=analyzed_blocks_completed,
                 progress_total=total_changed_block_count,
-                state_db_path=str(state.path),
+                state_db_path=state.db_label,
             )
             current_map_reader = SnapshotPartitionReader(
                 backup_set,
@@ -172,7 +172,7 @@ def _analyze_single_restore_point(
                     partition_number=source.partition_number,
                     progress_completed=analyzed_blocks_completed,
                     progress_total=total_changed_block_count,
-                    state_db_path=str(state.path),
+                    state_db_path=state.db_label,
                 )
                 parent_map_reader = SnapshotPartitionReader(
                     backup_set,
@@ -207,7 +207,7 @@ def _analyze_single_restore_point(
                 changed_block_index=block_index,
                 progress_completed=analyzed_blocks_completed,
                 progress_total=total_changed_block_count,
-                state_db_path=str(state.path),
+                state_db_path=state.db_label,
             )
             resolved_block = current_partition.resolved_data_blocks[block_index]
             stored_bytes = resolved_block.compressed_length
@@ -282,7 +282,7 @@ def _analyze_single_restore_point(
                 changed_block_index=block_index,
                 progress_completed=analyzed_blocks_completed,
                 progress_total=total_changed_block_count,
-                state_db_path=str(state.path),
+                state_db_path=state.db_label,
             )
 
     _flush_pending_buckets(state, file_number, pending_buckets)
@@ -302,18 +302,20 @@ def _analyze_single_restore_point(
 def analyze_file(
     target_path: Path,
     *,
-    state_db_path: Path,
+    state_db_path: Path | None = None,
+    in_memory_state: bool = False,
     include_parent_ownership: bool = False,
     progress: ProgressTracker | None = None,
     image_count: int = 1,
-) -> Path:
+) -> AggregateState:
     tracker = progress or ProgressTracker()
+    state_label = ":memory:" if in_memory_state else str(state_db_path)
     tracker.begin(
         "discover",
         "Opening backup set metadata.",
         target_file=str(target_path),
         requested_image_count=image_count,
-        state_db_path=str(state_db_path),
+        state_db_path=state_label,
     )
     with BackupSet.from_target_file(target_path) as backup_set:
         target_layout = backup_set.target_layout()
@@ -328,64 +330,62 @@ def analyze_file(
             target_backup_type=target_layout.backup_type,
             parent_file_number=backup_set.parent_file_number(target_layout.file_number),
             requested_image_count=image_count,
+            in_memory=in_memory_state,
         )
-        try:
-            total_changed_block_count = sum(
-                _count_changed_blocks(backup_set, file_number)
-                for file_number in selected_file_numbers
+        total_changed_block_count = sum(
+            _count_changed_blocks(backup_set, file_number)
+            for file_number in selected_file_numbers
+        )
+        tracker.update(
+            "state-init",
+            "Initialized aggregate state database.",
+            target_file_number=target_layout.file_number,
+            parent_file_number=backup_set.parent_file_number(target_layout.file_number),
+            backup_type=target_layout.backup_type,
+            requested_image_count=image_count,
+            analyzed_image_count=len(selected_file_numbers),
+            selected_file_numbers=selected_file_numbers,
+            progress_completed=0,
+            progress_total=total_changed_block_count,
+            state_db_path=state.db_label,
+        )
+
+        notes: set[str] = set()
+        analyzed_blocks_completed = 0
+
+        for image_index, file_number in enumerate(selected_file_numbers, start=1):
+            image_summary, analyzed_blocks_completed = _analyze_single_restore_point(
+                backup_set,
+                file_number,
+                include_parent_ownership=include_parent_ownership,
+                progress=tracker,
+                image_index=image_index,
+                image_total=len(selected_file_numbers),
+                total_changed_block_count=total_changed_block_count,
+                analyzed_blocks_completed=analyzed_blocks_completed,
+                notes=notes,
+                state=state,
             )
-            tracker.update(
-                "state-init",
-                "Initialized aggregate state database.",
-                target_file_number=target_layout.file_number,
-                parent_file_number=backup_set.parent_file_number(target_layout.file_number),
-                backup_type=target_layout.backup_type,
-                requested_image_count=image_count,
-                analyzed_image_count=len(selected_file_numbers),
-                selected_file_numbers=selected_file_numbers,
-                progress_completed=0,
-                progress_total=total_changed_block_count,
-                state_db_path=str(state.path),
-            )
+            state.add_analyzed_image(image_index, image_summary)
 
-            notes: set[str] = set()
-            analyzed_blocks_completed = 0
+        for note in sorted(notes):
+            state.record_note(note)
+        state.finalize_run()
 
-            for image_index, file_number in enumerate(selected_file_numbers, start=1):
-                image_summary, analyzed_blocks_completed = _analyze_single_restore_point(
-                    backup_set,
-                    file_number,
-                    include_parent_ownership=include_parent_ownership,
-                    progress=tracker,
-                    image_index=image_index,
-                    image_total=len(selected_file_numbers),
-                    total_changed_block_count=total_changed_block_count,
-                    analyzed_blocks_completed=analyzed_blocks_completed,
-                    notes=notes,
-                    state=state,
-                )
-                state.add_analyzed_image(image_index, image_summary)
+        tracker.update(
+            "rollup",
+            "Building directory rollups from aggregate state.",
+            progress_completed=total_changed_block_count,
+            progress_total=total_changed_block_count,
+            state_db_path=state.db_label,
+        )
+        state.finalize_directory_rollups()
+        tracker.update(
+            "rollup",
+            "Directory rollups complete.",
+            progress_completed=total_changed_block_count,
+            progress_total=total_changed_block_count,
+            state_db_path=state.db_label,
+        )
 
-            for note in sorted(notes):
-                state.record_note(note)
-            state.finalize_run()
-
-            tracker.update(
-                "rollup",
-                "Building directory rollups from aggregate state.",
-                progress_completed=total_changed_block_count,
-                progress_total=total_changed_block_count,
-                state_db_path=str(state.path),
-            )
-            state.finalize_directory_rollups()
-            tracker.update(
-                "rollup",
-                "Directory rollups complete.",
-                progress_completed=total_changed_block_count,
-                progress_total=total_changed_block_count,
-                state_db_path=str(state.path),
-            )
-        finally:
-            state.close()
-
-    return state_db_path
+    return state

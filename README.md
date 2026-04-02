@@ -2,7 +2,7 @@
 
 Macrium Analyzer is a local Windows-first tool for attributing the size of a Macrium Reflect `.mrimgx` restore point to the files and directories that own the changed blocks stored in that image.
 
-The current implementation supports both single-image and multi-image aggregate analysis for NTFS-backed restore points. It writes durable text, compact JSON, viewer-bundle, and SQLite state outputs, produces a directory-oriented view of contribution, and keeps filesystem metadata and unresolved ownership visible instead of silently dropping them.
+The current implementation supports both single-image and multi-image aggregate analysis for NTFS-backed restore points. It keeps canonical aggregate state in memory while a run is active, writes durable text and viewer-bundle outputs, produces a directory-oriented view of contribution, and keeps filesystem metadata and unresolved ownership visible instead of silently dropping them.
 
 ## What It Does
 
@@ -10,7 +10,7 @@ The current implementation supports both single-image and multi-image aggregate 
 - resolve changed blocks for a selected restore point within its backup set
 - attribute stored backup bytes to current NTFS owners at file and directory level
 - aggregate stored-byte impact across a selected restore-point window
-- keep a SQLite aggregate-state database as the canonical run artifact
+- keep SQLite aggregate state in memory during the run
 - write both flat attribution buckets and hierarchical directory rollups
 - emit a `.viewpack` bundle for the local static viewer
 - emit a JSON progress file plus an append-only progress log while analysis runs
@@ -47,16 +47,12 @@ macrium-analyzer analyze-mrimgx `
 
 ## Output Shape
 
-The compact JSON report includes:
+The tool writes:
 
-- summary metadata
-- analyzed restore points
-- flat directory records
-- flat file records
-- synthetic buckets
-- notes
+- a human-readable text report
+- a `.viewpack` bundle for the viewer
 
-The SQLite state database is the canonical aggregate state for a run. The text report, compact JSON report, and `.viewpack` bundle are all derived from it.
+SQLite remains the canonical aggregate state during analysis, but it is kept in memory by default rather than written as a durable user-facing artifact.
 
 The text report focuses on:
 

@@ -2,19 +2,18 @@
 
 ## Summary
 
-Macrium Analyzer now treats a SQLite database as the canonical aggregate state for each run. The analyzer writes block-attribution results into SQLite during analysis, derives directory rollups from that state after attribution completes, and then emits the durable text report, compact JSON report, and `.viewpack` bundle from SQLite.
+Macrium Analyzer now treats SQLite as the canonical aggregate state during each run. The analyzer writes block-attribution results into in-memory SQLite during analysis, derives directory rollups from that state after attribution completes, and then emits the durable text report and `.viewpack` bundle from it.
 
 This design replaces the older "build one giant in-memory report and serialize it afterward" approach. The goal is lower peak RAM during large multi-image runs while preserving the current viewer and reporting workflow.
 
 ## Current Architecture
 
-- Canonical run state lives in `<output-base>.state.sqlite3`.
+- Canonical run state lives in in-memory SQLite by default.
 - Changed-block attribution writes aggregate file, directory-bucket, and synthetic-bucket metrics into SQLite in bounded batches.
 - Image occurrence counts are normalized into relational tables instead of being carried around as large in-memory sets.
 - Directory rollups are derived in a post-analysis pass from canonical leaf rows rather than updated for every block during attribution.
 - Durable outputs are generated sequentially from SQLite:
   - text report
-  - compact JSON report
   - `.viewpack` bundle
 
 ## Output Design
@@ -24,7 +23,6 @@ This design replaces the older "build one giant in-memory report and serialize i
   - most specific impactful directories
   - a condensed tree
   - synthetic and unresolved buckets
-- The JSON report is now a compact flat audit/debug artifact rather than a giant nested tree dump.
 - The `.viewpack` bundle remains the browser-facing drill-down format.
 - The committed static viewer should continue to consume `.viewpack`, not raw SQLite and not the full JSON report.
 
@@ -54,10 +52,11 @@ This design replaces the older "build one giant in-memory report and serialize i
 - Measure where time is currently spent between NTFS map building, changed-block attribution, SQLite aggregation, and output generation.
 - Consider additional optimizations such as larger aggregate flush batches, cheaper overlap lookup paths, and more targeted mapper work.
 - Keep the design phase explicit before implementation so we choose the right concurrency model and avoid introducing SQLite writer contention or wasted Python-thread overhead.
+- Reuse the documented Python benchmark baseline in [docs/python-performance-baseline.md](g:\nas\Andrew\Projects\Macrium Analyzer\macrium-analyzer\docs\python-performance-baseline.md) when comparing later C# rewrite performance.
 
 ## Validation
 
-- Verify single-image and multi-image runs both produce `.txt`, `.json`, `.viewpack`, and `.state.sqlite3`.
+- Verify single-image and multi-image runs both produce `.txt` and `.viewpack`.
 - Verify directory totals and top contributors still reconcile with flat attribution buckets.
 - Verify the local viewer still opens `.viewpack` bundles and expands child directories lazily.
 - Compare peak RAM during multi-image runs against the prior in-memory-report design.

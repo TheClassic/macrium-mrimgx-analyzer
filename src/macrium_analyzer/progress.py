@@ -3,9 +3,57 @@ from __future__ import annotations
 import json
 import os
 import time
+import ctypes
+from ctypes import wintypes
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+
+class _ProcessMemoryCounters(ctypes.Structure):
+    _fields_ = [
+        ("cb", ctypes.c_ulong),
+        ("PageFaultCount", ctypes.c_ulong),
+        ("PeakWorkingSetSize", ctypes.c_size_t),
+        ("WorkingSetSize", ctypes.c_size_t),
+        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+        ("PagefileUsage", ctypes.c_size_t),
+        ("PeakPagefileUsage", ctypes.c_size_t),
+    ]
+
+
+_KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_PSAPI = ctypes.WinDLL("psapi", use_last_error=True)
+_GET_PROCESS_MEMORY_INFO = _PSAPI.GetProcessMemoryInfo
+_GET_PROCESS_MEMORY_INFO.argtypes = [
+    wintypes.HANDLE,
+    ctypes.POINTER(_ProcessMemoryCounters),
+    wintypes.DWORD,
+]
+_GET_PROCESS_MEMORY_INFO.restype = wintypes.BOOL
+
+
+def _memory_snapshot() -> dict[str, int]:
+    try:
+        counters = _ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(_ProcessMemoryCounters)
+        if not _GET_PROCESS_MEMORY_INFO(
+            _KERNEL32.GetCurrentProcess(),
+            ctypes.byref(counters),
+            counters.cb,
+        ):
+            return {}
+        return {
+            "process_working_set_bytes": int(counters.WorkingSetSize),
+            "process_peak_working_set_bytes": int(counters.PeakWorkingSetSize),
+            "process_pagefile_bytes": int(counters.PagefileUsage),
+            "process_peak_pagefile_bytes": int(counters.PeakPagefileUsage),
+        }
+    except Exception:
+        return {}
 
 
 @dataclass
@@ -33,6 +81,7 @@ class ProgressTracker:
             "elapsed_seconds": elapsed_seconds,
             **self._state,
         }
+        payload.update(_memory_snapshot())
         completed = payload.get("progress_completed")
         total = payload.get("progress_total")
         if isinstance(completed, int) and isinstance(total, int) and total > 0:
@@ -85,6 +134,10 @@ class ProgressTracker:
         if isinstance(elapsed_seconds, (int, float)):
             parts.append(f"elapsed={self._format_duration(float(elapsed_seconds))}")
 
+        peak_working_set = payload.get("process_peak_working_set_bytes")
+        if isinstance(peak_working_set, int) and peak_working_set > 0:
+            parts.append(f"peak_ws={self._format_bytes(peak_working_set)}")
+
         eta_seconds = payload.get("estimated_remaining_seconds")
         if isinstance(eta_seconds, (int, float)):
             parts.append(f"eta={self._format_duration(float(eta_seconds))}")
@@ -132,3 +185,15 @@ class ProgressTracker:
         if minutes:
             return f"{minutes}m{secs:02d}s"
         return f"{secs}s"
+
+    @staticmethod
+    def _format_bytes(value: int) -> str:
+        units = ["B", "KiB", "MiB", "GiB", "TiB"]
+        size = float(value)
+        for unit in units:
+            if abs(size) < 1024.0 or unit == units[-1]:
+                if unit == "B":
+                    return f"{int(round(size))}{unit}"
+                return f"{size:.1f}{unit}"
+            size /= 1024.0
+        return f"{size:.1f}PiB"
