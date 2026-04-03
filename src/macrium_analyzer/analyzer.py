@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
 from .models import AnalyzedImage, AttributionBucket
@@ -7,6 +9,14 @@ from .mrimgx import BackupSet, MrimgxError, SnapshotPartitionReader
 from .ntfs import NtfsMapper
 from .progress import ProgressTracker
 from .state_db import AggregateState
+
+
+@dataclass
+class _ParallelWorkerResult:
+    image_index: int
+    image_summary: AnalyzedImage
+    notes: list[str]
+    buckets: dict[str, AttributionBucket]
 
 
 def _bucket_key(owner: str) -> str:
@@ -46,14 +56,32 @@ def _count_changed_blocks(backup_set: BackupSet, file_number: int) -> int:
     )
 
 
+def _merge_bucket_maps(
+    destination: dict[str, AttributionBucket],
+    source: dict[str, AttributionBucket],
+) -> None:
+    for key, bucket in source.items():
+        aggregate = destination.setdefault(key, AttributionBucket(key=key))
+        aggregate.stored_bytes += bucket.stored_bytes
+        aggregate.changed_bytes += bucket.changed_bytes
+        aggregate.changed_ranges += bucket.changed_ranges
+        aggregate.blocks += bucket.blocks
+
+
 def _flush_pending_buckets(
-    state: AggregateState,
+    state: AggregateState | None,
     file_number: int,
     pending_buckets: dict[str, AttributionBucket],
+    collected_buckets: dict[str, AttributionBucket] | None = None,
 ) -> None:
     if not pending_buckets:
         return
-    state.add_bucket_batch(file_number, pending_buckets)
+    if state is not None:
+        state.add_bucket_batch(file_number, pending_buckets)
+    else:
+        if collected_buckets is None:
+            raise ValueError("Collected buckets are required when no aggregate state is provided.")
+        _merge_bucket_maps(collected_buckets, pending_buckets)
     pending_buckets.clear()
 
 
@@ -62,27 +90,29 @@ def _analyze_single_restore_point(
     file_number: int,
     *,
     include_parent_ownership: bool,
-    progress: ProgressTracker,
-    image_index: int,
-    image_total: int,
-    total_changed_block_count: int,
-    analyzed_blocks_completed: int,
+    progress: ProgressTracker | None,
+    image_index: int | None,
+    image_total: int | None,
+    total_changed_block_count: int = 0,
+    analyzed_blocks_completed: int = 0,
     notes: set[str],
-    state: AggregateState,
-) -> tuple[AnalyzedImage, int]:
+    state: AggregateState | None,
+) -> tuple[AnalyzedImage, int, dict[str, AttributionBucket]]:
     layout = backup_set.files[file_number]
     parent_file_number = backup_set.parent_file_number(file_number)
+    collected_buckets: dict[str, AttributionBucket] = {}
 
-    progress.update(
-        "discover",
-        "Resolved restore point and parent.",
-        image_index=image_index,
-        image_total=image_total,
-        image_file_number=file_number,
-        target_file_number=backup_set.target_file_number,
-        parent_file_number=parent_file_number,
-        backup_type=layout.backup_type,
-    )
+    if progress is not None and image_index is not None and image_total is not None:
+        progress.update(
+            "discover",
+            "Resolved restore point and parent.",
+            image_index=image_index,
+            image_total=image_total,
+            image_file_number=file_number,
+            target_file_number=backup_set.target_file_number,
+            parent_file_number=parent_file_number,
+            backup_type=layout.backup_type,
+        )
 
     current_snapshot = backup_set.build_snapshot(file_number)
     parent_snapshot = (
@@ -117,29 +147,10 @@ def _analyze_single_restore_point(
         changed_block_indexes = changed_block_map[partition_key]
         if not changed_block_indexes:
             continue
-        progress.update(
-            "aggregate",
-            "Preparing partition analysis.",
-            image_index=image_index,
-            image_total=image_total,
-            image_file_number=file_number,
-            partition_index=partition_index,
-            partition_total=len(partition_items),
-            disk_number=source.disk_number,
-            partition_number=source.partition_number,
-            fs_type=source.fs_type,
-            changed_block_total=len(changed_block_indexes),
-            progress_completed=analyzed_blocks_completed,
-            progress_total=total_changed_block_count,
-            state_db_path=state.db_label,
-        )
-
-        current_mapper = None
-        parent_mapper = None
-        if source.is_ntfs:
+        if progress is not None and image_index is not None and image_total is not None:
             progress.update(
-                "mapper",
-                "Building current NTFS ownership map.",
+                "aggregate",
+                "Preparing partition analysis.",
                 image_index=image_index,
                 image_total=image_total,
                 image_file_number=file_number,
@@ -147,22 +158,20 @@ def _analyze_single_restore_point(
                 partition_total=len(partition_items),
                 disk_number=source.disk_number,
                 partition_number=source.partition_number,
+                fs_type=source.fs_type,
+                changed_block_total=len(changed_block_indexes),
                 progress_completed=analyzed_blocks_completed,
                 progress_total=total_changed_block_count,
-                state_db_path=state.db_label,
+                state_db_path=(state.db_label if state is not None else ":worker:"),
             )
-            current_map_reader = SnapshotPartitionReader(
-                backup_set,
-                current_snapshot,
-                partition_key,
-                max_cached_blocks=16,
-            )
-            current_mapper = NtfsMapper(current_map_reader).build()
-            current_map_reader.clear_cache()
-            if include_parent_ownership and parent_snapshot is not None:
+
+        current_mapper = None
+        parent_mapper = None
+        if source.is_ntfs:
+            if progress is not None and image_index is not None and image_total is not None:
                 progress.update(
                     "mapper",
-                    "Building parent NTFS ownership map.",
+                    "Building current NTFS ownership map.",
                     image_index=image_index,
                     image_total=image_total,
                     image_file_number=file_number,
@@ -172,8 +181,32 @@ def _analyze_single_restore_point(
                     partition_number=source.partition_number,
                     progress_completed=analyzed_blocks_completed,
                     progress_total=total_changed_block_count,
-                    state_db_path=state.db_label,
+                    state_db_path=(state.db_label if state is not None else ":worker:"),
                 )
+            current_map_reader = SnapshotPartitionReader(
+                backup_set,
+                current_snapshot,
+                partition_key,
+                max_cached_blocks=16,
+            )
+            current_mapper = NtfsMapper(current_map_reader).build()
+            current_map_reader.clear_cache()
+            if include_parent_ownership and parent_snapshot is not None:
+                if progress is not None and image_index is not None and image_total is not None:
+                    progress.update(
+                        "mapper",
+                        "Building parent NTFS ownership map.",
+                        image_index=image_index,
+                        image_total=image_total,
+                        image_file_number=file_number,
+                        partition_index=partition_index,
+                        partition_total=len(partition_items),
+                        disk_number=source.disk_number,
+                        partition_number=source.partition_number,
+                        progress_completed=analyzed_blocks_completed,
+                        progress_total=total_changed_block_count,
+                        state_db_path=(state.db_label if state is not None else ":worker:"),
+                    )
                 parent_map_reader = SnapshotPartitionReader(
                     backup_set,
                     parent_snapshot,
@@ -189,26 +222,27 @@ def _analyze_single_restore_point(
         else:
             notes.add(
                 f"Partition disk {source.disk_number} partition {source.partition_number} is {source.fs_type or 'unknown'}; exact file attribution is NTFS-only, so this partition stays bucketed."
-            )
+                )
 
         for block_counter, block_index in enumerate(changed_block_indexes, start=1):
-            progress.update(
-                "aggregate",
-                "Attributing changed blocks.",
-                image_index=image_index,
-                image_total=image_total,
-                image_file_number=file_number,
-                partition_index=partition_index,
-                partition_total=len(partition_items),
-                disk_number=source.disk_number,
-                partition_number=source.partition_number,
-                changed_blocks_completed=block_counter,
-                changed_block_total=len(changed_block_indexes),
-                changed_block_index=block_index,
-                progress_completed=analyzed_blocks_completed,
-                progress_total=total_changed_block_count,
-                state_db_path=state.db_label,
-            )
+            if progress is not None and image_index is not None and image_total is not None:
+                progress.update(
+                    "aggregate",
+                    "Attributing changed blocks.",
+                    image_index=image_index,
+                    image_total=image_total,
+                    image_file_number=file_number,
+                    partition_index=partition_index,
+                    partition_total=len(partition_items),
+                    disk_number=source.disk_number,
+                    partition_number=source.partition_number,
+                    changed_blocks_completed=block_counter,
+                    changed_block_total=len(changed_block_indexes),
+                    changed_block_index=block_index,
+                    progress_completed=analyzed_blocks_completed,
+                    progress_total=total_changed_block_count,
+                    state_db_path=(state.db_label if state is not None else ":worker:"),
+                )
             resolved_block = current_partition.resolved_data_blocks[block_index]
             stored_bytes = resolved_block.compressed_length
             image_stored_bytes += stored_bytes
@@ -264,28 +298,29 @@ def _analyze_single_restore_point(
                 image_bucket_keys.add(key)
 
             if len(pending_buckets) >= flush_threshold:
-                _flush_pending_buckets(state, file_number, pending_buckets)
+                _flush_pending_buckets(state, file_number, pending_buckets, collected_buckets)
 
             analyzed_blocks_completed += 1
-            progress.update(
-                "aggregate",
-                "Attributing changed blocks.",
-                image_index=image_index,
-                image_total=image_total,
-                image_file_number=file_number,
-                partition_index=partition_index,
-                partition_total=len(partition_items),
-                disk_number=source.disk_number,
-                partition_number=source.partition_number,
-                changed_blocks_completed=block_counter,
-                changed_block_total=len(changed_block_indexes),
-                changed_block_index=block_index,
-                progress_completed=analyzed_blocks_completed,
-                progress_total=total_changed_block_count,
-                state_db_path=state.db_label,
-            )
+            if progress is not None and image_index is not None and image_total is not None:
+                progress.update(
+                    "aggregate",
+                    "Attributing changed blocks.",
+                    image_index=image_index,
+                    image_total=image_total,
+                    image_file_number=file_number,
+                    partition_index=partition_index,
+                    partition_total=len(partition_items),
+                    disk_number=source.disk_number,
+                    partition_number=source.partition_number,
+                    changed_blocks_completed=block_counter,
+                    changed_block_total=len(changed_block_indexes),
+                    changed_block_index=block_index,
+                    progress_completed=analyzed_blocks_completed,
+                    progress_total=total_changed_block_count,
+                    state_db_path=(state.db_label if state is not None else ":worker:"),
+                )
 
-    _flush_pending_buckets(state, file_number, pending_buckets)
+    _flush_pending_buckets(state, file_number, pending_buckets, collected_buckets)
     image_summary = AnalyzedImage(
         file_path=layout.file_path,
         file_number=file_number,
@@ -296,7 +331,35 @@ def _analyze_single_restore_point(
         changed_block_count=changed_block_count,
         bucket_count=len(image_bucket_keys),
     )
-    return image_summary, analyzed_blocks_completed
+    return image_summary, analyzed_blocks_completed, collected_buckets
+
+
+def _analyze_single_restore_point_worker(
+    target_path: str,
+    file_number: int,
+    *,
+    include_parent_ownership: bool,
+    image_index: int,
+    image_total: int,
+) -> _ParallelWorkerResult:
+    notes: set[str] = set()
+    with BackupSet.from_target_file(Path(target_path)) as backup_set:
+        image_summary, _ignored_completed, buckets = _analyze_single_restore_point(
+            backup_set,
+            file_number,
+            include_parent_ownership=include_parent_ownership,
+            progress=None,
+            image_index=image_index,
+            image_total=image_total,
+            notes=notes,
+            state=None,
+        )
+    return _ParallelWorkerResult(
+        image_index=image_index,
+        image_summary=image_summary,
+        notes=sorted(notes),
+        buckets=buckets,
+    )
 
 
 def analyze_file(
@@ -307,6 +370,7 @@ def analyze_file(
     include_parent_ownership: bool = False,
     progress: ProgressTracker | None = None,
     image_count: int = 1,
+    parallel_images: int = 6,
 ) -> AggregateState:
     tracker = progress or ProgressTracker()
     state_label = ":memory:" if in_memory_state else str(state_db_path)
@@ -332,10 +396,11 @@ def analyze_file(
             requested_image_count=image_count,
             in_memory=in_memory_state,
         )
-        total_changed_block_count = sum(
-            _count_changed_blocks(backup_set, file_number)
+        per_image_changed_block_count = {
+            file_number: _count_changed_blocks(backup_set, file_number)
             for file_number in selected_file_numbers
-        )
+        }
+        total_changed_block_count = sum(per_image_changed_block_count.values())
         tracker.update(
             "state-init",
             "Initialized aggregate state database.",
@@ -353,20 +418,62 @@ def analyze_file(
         notes: set[str] = set()
         analyzed_blocks_completed = 0
 
-        for image_index, file_number in enumerate(selected_file_numbers, start=1):
-            image_summary, analyzed_blocks_completed = _analyze_single_restore_point(
-                backup_set,
-                file_number,
-                include_parent_ownership=include_parent_ownership,
-                progress=tracker,
-                image_index=image_index,
+        worker_count = min(max(int(parallel_images), 1), len(selected_file_numbers))
+        if worker_count > 1 and len(selected_file_numbers) > 1:
+            tracker.update(
+                "aggregate",
+                "Launching parallel image workers.",
                 image_total=len(selected_file_numbers),
-                total_changed_block_count=total_changed_block_count,
-                analyzed_blocks_completed=analyzed_blocks_completed,
-                notes=notes,
-                state=state,
+                progress_completed=0,
+                progress_total=total_changed_block_count,
+                parallel_workers=worker_count,
+                state_db_path=state.db_label,
             )
-            state.add_analyzed_image(image_index, image_summary)
+            with ProcessPoolExecutor(max_workers=worker_count) as executor:
+                future_map = {
+                    executor.submit(
+                        _analyze_single_restore_point_worker,
+                        str(target_path),
+                        file_number,
+                        include_parent_ownership=include_parent_ownership,
+                        image_index=image_index,
+                        image_total=len(selected_file_numbers),
+                    ): (image_index, file_number)
+                    for image_index, file_number in enumerate(selected_file_numbers, start=1)
+                }
+                for future in as_completed(future_map):
+                    image_index, file_number = future_map[future]
+                    result = future.result()
+                    state.add_bucket_batch(result.image_summary.file_number, result.buckets)
+                    state.add_analyzed_image(result.image_index, result.image_summary)
+                    notes.update(result.notes)
+                    analyzed_blocks_completed += per_image_changed_block_count[file_number]
+                    tracker.update(
+                        "aggregate",
+                        "Merged parallel worker results.",
+                        image_index=image_index,
+                        image_total=len(selected_file_numbers),
+                        image_file_number=file_number,
+                        progress_completed=analyzed_blocks_completed,
+                        progress_total=total_changed_block_count,
+                        parallel_workers=worker_count,
+                        state_db_path=state.db_label,
+                    )
+        else:
+            for image_index, file_number in enumerate(selected_file_numbers, start=1):
+                image_summary, analyzed_blocks_completed, _ignored_buckets = _analyze_single_restore_point(
+                    backup_set,
+                    file_number,
+                    include_parent_ownership=include_parent_ownership,
+                    progress=tracker,
+                    image_index=image_index,
+                    image_total=len(selected_file_numbers),
+                    total_changed_block_count=total_changed_block_count,
+                    analyzed_blocks_completed=analyzed_blocks_completed,
+                    notes=notes,
+                    state=state,
+                )
+                state.add_analyzed_image(image_index, image_summary)
 
         for note in sorted(notes):
             state.record_note(note)

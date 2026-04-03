@@ -270,6 +270,12 @@ def _add_analyze_mrimgx(subcommands: argparse._SubParsersAction[argparse.Argumen
         help="How many images to analyze ending at the target file. Parent images are resolved automatically.",
     )
     parser.add_argument(
+        "--parallel-images",
+        type=int,
+        default=6,
+        help="How many image workers to run in parallel. Defaults to 6 and is capped to the number of analyzed images.",
+    )
+    parser.add_argument(
         "--progress-file",
         help="Optional path to a JSON status file that is updated while analysis runs.",
     )
@@ -326,6 +332,7 @@ def _handle_analyze_mrimgx(args: argparse.Namespace) -> int:
             include_parent_ownership=bool(args.with_parent_ownership),
             progress=tracker,
             image_count=int(args.image_count),
+            parallel_images=int(args.parallel_images),
         )
     except Exception as exc:
         tracker.fail(

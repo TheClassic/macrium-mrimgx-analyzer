@@ -10,6 +10,7 @@ The current implementation supports both single-image and multi-image aggregate 
 - resolve changed blocks for a selected restore point within its backup set
 - attribute stored backup bytes to current NTFS owners at file and directory level
 - aggregate stored-byte impact across a selected restore-point window
+- analyze multiple selected images in parallel by default, or override the worker count with `--parallel-images`
 - keep SQLite aggregate state in memory during the run
 - write both flat attribution buckets and hierarchical directory rollups
 - emit a `.viewpack` bundle for the local static viewer
@@ -36,6 +37,7 @@ python -m pip install -e .
 macrium-analyzer analyze-mrimgx `
   --file "D:\Backups\34EEA0E7CD73CF00-24-24.mrimgx" `
   --image-count 4 `
+  --parallel-images 4 `
 ```
 
 3. Launch the html viewer and load the viewpack:
